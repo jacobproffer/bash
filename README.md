@@ -5,6 +5,7 @@ Collection of bash scripts for organizing files and folders.
 - **rename_underscores_to_dashes**: Converts underscores (\_) to dashes (-) in folder names recursively.
 - **rename_files_structured**: Renames image files to `<date>-<location>-<camera>-<NN>`, reading the date, camera and location (tags or GPS) from each photo's metadata. RAW+JPG pairs share a number.
 - **undo_rename**: Reverts the most recent run of `rename_files_structured` using its log.
+- **organize_photos**: Scans a directory recursively and moves files into `YYYY-MM/YYYY-MM-DD` subfolders based on the date at the start of each filename.
 
 ## Prerequisites
 
@@ -107,4 +108,32 @@ sudo mv undo_rename.sh /usr/local/bin/undo_rename
 
 ```bash
 undo_rename
+```
+
+## Organize Photos
+
+Scans all files recursively in a target directory and moves them into `YYYY-MM/YYYY-MM-DD` subfolders based on the date found at the start of each filename (expected format: `YYYY-MM-DD ...`, e.g. `2024-05-19 16.33.26.jpg`).
+
+### Make Organize Photos Script Executable
+
+```bash
+chmod +x organize_photos.sh
+```
+
+### Move Organize Photos Script to User Local Bin
+
+```bash
+sudo mv organize_photos.sh /usr/local/bin/organize_photos
+```
+
+### Execute Organize Photos Script
+
+```bash
+organize_photos /path/to/Camera\ Uploads
+```
+
+Use `--dry-run` to preview what would happen without moving any files:
+
+```bash
+organize_photos --dry-run /path/to/Camera\ Uploads
 ```
