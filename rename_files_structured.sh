@@ -2,12 +2,20 @@
 # rename_files_structured.sh
 #
 # Renames photos in the current directory to:
-#   <date>-<location>-<camera>-<NN>.<ext>
+#   <date>_<location>_<camera>_<NN>.<ext>
 #
-#   date      EXIF DateTimeOriginal → CreateDate → file modified date
-#   location  argument → City / Location metadata tags → GPS reverse lookup
-#             → most common location found in the folder → asks you
-#   camera    EXIF Make + Model (e.g. "ricoh-gr-ii"), shortened via CAMERA_ALIASES
+# Underscores separate the fields; dashes join words inside a field
+# (2026-11-14_new-york_ricoh-gr-ii_01.jpg).
+#
+#   date      date already at the start of the filename → EXIF DateTimeOriginal
+#             → CreateDate → file modified date. (Old exports often carry the
+#             export date in EXIF, so a date you already put in the name wins.)
+#   location  argument → location already in the filename (from an earlier
+#             run, old dash-style names included) → City / Location metadata
+#             tags → GPS reverse lookup → most common location found in the
+#             folder → asks you
+#   camera    EXIF Make + Model (e.g. "ricoh-gr-ii"), shortened via
+#             CAMERA_ALIASES → camera already in the filename
 #
 # Files from the same shot (e.g. DSCF1234.JPG + DSCF1234.RAF) share a number.
 # Each run is appended to rename_log.txt; `undo_rename` reverts the latest run.
@@ -33,6 +41,11 @@ declare -A CAMERA_ALIASES=(
   ["sony-ilce-7m4"]="sony-a7iv"
   ["fujifilm-x100v"]="fujifilm-x100v"
 )
+
+# Cameras to recognise in old dash-style names when a photo has no camera in
+# its metadata (e.g. 2012-04-14-marquette-canon-sd400-02.jpg). iPhones and
+# every camera found in the folder's metadata are recognised automatically.
+KNOWN_CAMERAS=(ricoh-gr-ii)
 
 IMAGE_EXTS=(jpg jpeg heic heif png tif tiff dng raf arw cr2 cr3 nef orf rw2)
 LOGFILE="rename_log.txt"
@@ -97,7 +110,7 @@ camera_name() {   # camera_name <make> <model>
   else
     name="$brand-$model"                    # "ricoh-gr-ii", "fujifilm-x100v"
   fi
-  printf '%s' "${CAMERA_ALIASES[$name]:-$name}"
+  [[ -n "$name" ]] && printf '%s' "${CAMERA_ALIASES[$name]:-$name}"
 }
 
 declare -A GEO_CACHE
@@ -118,6 +131,41 @@ reverse_geocode() {   # sets GEO_RESULT; caches per ~1 km grid cell
   GEO_CACHE[$key]="$GEO_RESULT"
 }
 
+declare -A KNOWN_CAMS
+for c in "${KNOWN_CAMERAS[@]}" "${CAMERA_ALIASES[@]}"; do KNOWN_CAMS[$c]=1; done
+is_camera() { [[ -n "${KNOWN_CAMS[$1]+set}" || "$1" =~ ^iphone(-[a-z0-9]+)*$ ]]; }
+
+# Location and camera already in a name this script (or you) made, so
+# re-running keeps them.
+#   new style  <date>_<location>_<camera>_<NN>, <date>_<camera>_<NN>, <date>_<location>_<NN>
+#   old style  <date>-<location>-<camera>-<NN>  (camera found by is_camera)
+NAME_LOC=""; NAME_CAM=""
+parse_name() {   # parse_name <name without extension> <camera from EXIF>
+  local base="$1" exif_cam="$2" rest tail
+  local d='^[0-9]{4}-[0-9]{2}-[0-9]{2}'
+  NAME_LOC=""; NAME_CAM=""
+  if [[ "$base" =~ ${d}_([a-z0-9-]+)_([a-z0-9-]+)_[0-9]+$ ]]; then
+    NAME_LOC="${BASH_REMATCH[1]}"; NAME_CAM="${BASH_REMATCH[2]}"
+  elif [[ "$base" =~ ${d}_([a-z0-9-]+)_[0-9]+$ ]]; then
+    rest="${BASH_REMATCH[1]}"            # is_camera overwrites BASH_REMATCH
+    if is_camera "$rest"; then NAME_CAM="$rest"; else NAME_LOC="$rest"; fi
+  elif [[ "$base" =~ ${d}-([a-z0-9-]+)-[0-9]+$ ]]; then
+    rest="${BASH_REMATCH[1]}"; tail="$rest"
+    while :; do                        # longest known camera at the end wins
+      if is_camera "$tail"; then
+        NAME_CAM="$tail"
+        [[ "$tail" != "$rest" ]] && NAME_LOC="${rest%-"$tail"}"
+        return
+      fi
+      [[ "$tail" == *-* ]] || break
+      tail="${tail#*-}"
+    done
+    # No camera recognised: if the photo doesn't name one either, keep the
+    # whole middle part as the location rather than lose it.
+    [[ -z "$exif_cam" ]] && NAME_LOC="$rest"
+  fi
+}
+
 # ── read metadata (one exiftool call for the whole folder) ──────────────────
 EXT_ARGS=()
 for e in "${IMAGE_EXTS[@]}"; do EXT_ARGS+=(-ext "$e"); done
@@ -126,7 +174,7 @@ FMT="\$DateTimeOriginal${SEP}\$CreateDate${SEP}\$FileModifyDate${SEP}\$Make${SEP
 FMT+="${SEP}\$City${SEP}\$Location${SEP}\$Sub-location"
 FMT+="${SEP}\$Composite:GPSLatitude#${SEP}\$Composite:GPSLongitude#${SEP}\$FileName"
 
-declare -A SHOT_TIME SHOT_MAKE SHOT_MODEL SHOT_PLACE SHOT_LAT SHOT_LON SHOT_FILES
+declare -A SHOT_TIME SHOT_MAKE SHOT_MODEL SHOT_PLACE SHOT_NAMELOC SHOT_NAMECAM SHOT_LAT SHOT_LON SHOT_FILES
 declare -a ALL_FILES=()
 
 while IFS="$SEP" read -r dto cdate fmod make model city loc subloc lat lon fname; do
@@ -134,6 +182,12 @@ while IFS="$SEP" read -r dto cdate fmod make model city loc subloc lat lon fname
   ALL_FILES+=("$fname")
   shot="${fname%.*}"
   when="${dto:-${cdate:-$fmod}}"
+  # A date already at the start of the name wins over EXIF when they differ
+  # (EXIF may hold an export date). Such shots sort after timed ones on that
+  # date, in filename order, which keeps their old numbering.
+  if [[ "$shot" =~ ^([0-9]{4}-[0-9]{2}-[0-9]{2}) && "${when%% *}" != "${BASH_REMATCH[1]}" ]]; then
+    when="${BASH_REMATCH[1]} ~$shot"
+  fi
   # A shot's time is its earliest file's time.
   if [[ -z "${SHOT_TIME[$shot]+set}" || ( -n "$when" && "$when" < "${SHOT_TIME[$shot]}" ) ]]; then
     SHOT_TIME[$shot]="$when"
@@ -152,7 +206,18 @@ fi
 
 # Shots in capture order
 mapfile -t SHOTS < <(for s in "${!SHOT_TIME[@]}"; do printf '%s%s%s\n' "${SHOT_TIME[$s]}" "$SEP" "$s"; done \
-                     | sort | cut -d"$SEP" -f2)
+                     | LC_ALL=C sort | cut -d"$SEP" -f2)
+
+# Cameras in this folder's metadata count as known, then read existing names.
+declare -A SHOT_CAM
+for s in "${SHOTS[@]}"; do
+  SHOT_CAM[$s]=$(camera_name "${SHOT_MAKE[$s]:-}" "${SHOT_MODEL[$s]:-}")
+  [[ -n "${SHOT_CAM[$s]}" ]] && KNOWN_CAMS[${SHOT_CAM[$s]}]=1
+done
+for s in "${SHOTS[@]}"; do
+  parse_name "$s" "${SHOT_CAM[$s]}"
+  SHOT_NAMELOC[$s]="$NAME_LOC"; SHOT_NAMECAM[$s]="$NAME_CAM"
+done
 
 # ── resolve location per shot ───────────────────────────────────────────────
 declare -A SHOT_LOC
@@ -163,7 +228,7 @@ else
   declare -A LOC_COUNT
   looked_up=false
   for s in "${SHOTS[@]}"; do
-    name="${SHOT_PLACE[$s]:-}"
+    name="${SHOT_NAMELOC[$s]:-${SHOT_PLACE[$s]:-}}"
     if [[ -z "$name" && $USE_GPS == true && -n "${SHOT_LAT[$s]:-}" ]]; then
       $looked_up || { echo "📍 Looking up GPS locations…"; looked_up=true; }
       reverse_geocode "${SHOT_LAT[$s]}" "${SHOT_LON[$s]}"
@@ -193,10 +258,10 @@ declare -A SHOT_PREFIX PREFIX_TOTAL PREFIX_SEQ
 for s in "${SHOTS[@]}"; do
   date="${DATE_ARG:-${SHOT_TIME[$s]%% *}}"
   if [[ -n "$CAMERA_ARG" ]]; then cam=$(slugify "$CAMERA_ARG")
-  else cam=$(camera_name "${SHOT_MAKE[$s]:-}" "${SHOT_MODEL[$s]:-}"); fi
+  else cam="${SHOT_CAM[$s]:-${SHOT_NAMECAM[$s]}}"; fi
   prefix=""
   for part in "$date" "${SHOT_LOC[$s]}" "$cam"; do
-    [[ -n "$part" ]] && prefix+="${prefix:+-}$part"
+    [[ -n "$part" ]] && prefix+="${prefix:+_}$part"
   done
   SHOT_PREFIX[$s]="$prefix"
   PREFIX_TOTAL[$prefix]=$(( ${PREFIX_TOTAL[$prefix]:-0} + 1 ))
@@ -212,7 +277,7 @@ for s in "${SHOTS[@]}"; do
   for f in "${files[@]}"; do
     [[ -z "$f" ]] && continue
     ext=$(printf '%s' "${f##*.}" | tr '[:upper:]' '[:lower:]')
-    new="$prefix-$num.$ext"
+    new="${prefix}_$num.$ext"
     [[ "$f" == "$new" ]] && continue
     SRC+=("$f"); DST+=("$new")
   done
