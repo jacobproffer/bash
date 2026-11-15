@@ -8,7 +8,8 @@
 #   <target>/2026-11/2026-11-14_japan/...              --trip=japan
 #
 # Expected filename format: YYYY-MM-DD... (e.g. "2024-05-19 16.33.26.jpg" or
-# "2024-05-19_kyoto_ricoh-gr-ii_01.jpg").
+# "2024-05-19_kyoto_ricoh-gr-ii_01.jpg"), or YYYY-MM... when the day isn't
+# known ("2018-07_marquette_iphone-6_14.jpg").
 #
 # Without --trip, every dated file is moved into its month folder, including
 # files in old YYYY-MM/YYYY-MM-DD day folders. Their rename_log.txt is merged
@@ -67,10 +68,11 @@ fi
 
 TARGET_DIR="$(cd "$TARGET_DIR" && pwd)"   # normalise to absolute path
 
-DATE_RE='^([0-9]{4})-([0-9]{2})-([0-9]{2})'
+DATE_RE='^([0-9]{4})-([0-9]{2})(-[0-9]{2})?([-_ .]|$)'   # YYYY-MM-DD or YYYY-MM
 MONTH_RE='^[0-9]{4}-[0-9]{2}$'
 DAY_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
-TRIP_DIR_RE='^[0-9]{4}-[0-9]{2}/[0-9]{4}-[0-9]{2}-[0-9]{2}[-_][^/]+/'   # _name, or old -name
+# Trip folders: YYYY-MM-DD_name, old YYYY-MM-DD-name, or YYYY-MM-name.
+TRIP_DIR_RE='^[0-9]{4}-[0-9]{2}/[0-9]{4}-[0-9]{2}(-[0-9]{2})?[-_][a-z][^/]*/'
 
 # ── collect the files to move ───────────────────────────────────────────────
 FILES=()
@@ -102,7 +104,7 @@ done < <(find "$TARGET_DIR" -type f -print0)
 # A trip folder is named after the earliest date in the batch.
 TRIP_DIR=""
 if [[ -n "$TRIP" && ${#FILES[@]} -gt 0 ]]; then
-    first=$(for f in "${FILES[@]}"; do basename "$f" | cut -c1-10; done | sort | head -1)
+    first=$(for f in "${FILES[@]}"; do basename "$f" | sed -E 's/^([0-9]{4}-[0-9]{2}(-[0-9]{2})?).*/\1/'; done | sort | head -1)
     TRIP_DIR="${first:0:7}/${first}_${TRIP}"
 fi
 
@@ -158,7 +160,8 @@ if [[ -z "$TRIP" ]]; then
         [[ "$day" =~ $DAY_RE && "$(basename "$month_dir")" =~ $MONTH_RE ]] || continue
 
         # In a dry run the photos haven't moved yet, so don't count them.
-        ignore=(! -name .DS_Store ! -name "$LOGFILE")
+        # ._* files are macOS metadata companions on exFAT/FAT drives.
+        ignore=(! -name .DS_Store ! -name '._*' ! -name "$LOGFILE")
         [[ "$DRY_RUN" == true ]] && ignore+=(! -name '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*')
         if [[ -n "$(find "$day_dir" -mindepth 1 "${ignore[@]}" | head -1)" ]]; then
             echo "KEEP (not empty): ${day_dir#"$TARGET_DIR"/}"
@@ -172,6 +175,7 @@ if [[ -z "$TRIP" ]]; then
         echo "REMOVE FOLDER: ${day_dir#"$TARGET_DIR"/}"
         if [[ "$DRY_RUN" == false ]]; then
             rm -f "$day_dir/$LOGFILE" "$day_dir/.DS_Store"
+            find "$day_dir" -mindepth 1 -maxdepth 1 -name '._*' -delete
             rmdir "$day_dir"
         fi
         removed=$((removed + 1))

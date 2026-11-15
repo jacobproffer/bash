@@ -7,15 +7,17 @@
 # Underscores separate the fields; dashes join words inside a field
 # (2026-11-14_new-york_ricoh-gr-ii_01.jpg).
 #
-#   date      date already at the start of the filename → EXIF DateTimeOriginal
+#   date      date already at the start of the filename (YYYY-MM-DD, or YYYY-MM
+#             when the day isn't known; kept as YYYY-MM unless EXIF has a full
+#             date in that same month) → EXIF DateTimeOriginal
 #             → CreateDate → file modified date. (Old exports often carry the
 #             export date in EXIF, so a date you already put in the name wins.)
 #   location  argument → location already in the filename (from an earlier
 #             run, old dash-style names included) → City / Location metadata
 #             tags → GPS reverse lookup → most common location found in the
 #             folder → asks you
-#   camera    EXIF Make + Model (e.g. "ricoh-gr-ii"), shortened via
-#             CAMERA_ALIASES → camera already in the filename
+#   camera    camera already in the filename (see KNOWN_CAMERAS) → EXIF Make +
+#             Model (e.g. "ricoh-gr-ii"), shortened via CAMERA_ALIASES
 #
 # Files from the same shot (e.g. DSCF1234.JPG + DSCF1234.RAF) share a number.
 # Each run is appended to rename_log.txt; `undo_rename` reverts the latest run.
@@ -40,12 +42,18 @@ set -uo pipefail
 declare -A CAMERA_ALIASES=(
   ["sony-ilce-7m4"]="sony-a7iv"
   ["fujifilm-x100v"]="fujifilm-x100v"
+  ["canon-eos-40d"]="canon-40d"
+  ["samsung-digimax-s500-kenox-s500-digimax-cyber-530"]="samsung-digimax-s500"
 )
 
-# Cameras to recognise in old dash-style names when a photo has no camera in
-# its metadata (e.g. 2012-04-14-marquette-canon-sd400-02.jpg). iPhones and
-# every camera found in the folder's metadata are recognised automatically.
-KNOWN_CAMERAS=(ricoh-gr-ii)
+# Cameras to recognise in old dash-style names (date-location-camera-NN).
+# A camera found in the name wins over the metadata (film scans, for example,
+# report the scanner), except "unknown". iPhones and every camera found in
+# the folder's metadata are recognised automatically.
+KNOWN_CAMERAS=(
+  ricoh-gr-ii fujifilm-x-pro1 fujifilm-quicksnap canon-40d nikon-d40
+  samsung-digimax-s500 samung-epic-4g campsnap unknown
+)
 
 IMAGE_EXTS=(jpg jpeg heic heif png tif tiff dng raf arw cr2 cr3 nef orf rw2)
 LOGFILE="rename_log.txt"
@@ -140,30 +148,38 @@ is_camera() { [[ -n "${KNOWN_CAMS[$1]+set}" || "$1" =~ ^iphone(-[a-z0-9]+)*$ ]];
 #   new style  <date>_<location>_<camera>_<NN>, <date>_<camera>_<NN>, <date>_<location>_<NN>
 #   old style  <date>-<location>-<camera>-<NN>  (camera found by is_camera)
 NAME_LOC=""; NAME_CAM=""
-parse_name() {   # parse_name <name without extension> <camera from EXIF>
-  local base="$1" exif_cam="$2" rest tail
-  local d='^[0-9]{4}-[0-9]{2}-[0-9]{2}'
+parse_name() {   # parse_name <name without extension>
+  local base rest tail
   NAME_LOC=""; NAME_CAM=""
-  if [[ "$base" =~ ${d}_([a-z0-9-]+)_([a-z0-9-]+)_[0-9]+$ ]]; then
+  base=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  # Strip the date (YYYY-MM-DD or YYYY-MM) and match what follows it.
+  [[ "$base" =~ ^[0-9]{4}-[0-9]{2}(-[0-9]{2})?([-_].*)$ ]] || return
+  base="${BASH_REMATCH[2]}"
+  if [[ "$base" =~ ^_([a-z0-9-]+)_([a-z0-9-]+)_[0-9]+$ ]]; then
     NAME_LOC="${BASH_REMATCH[1]}"; NAME_CAM="${BASH_REMATCH[2]}"
-  elif [[ "$base" =~ ${d}_([a-z0-9-]+)_[0-9]+$ ]]; then
+    return
+  elif [[ "$base" =~ ^_([a-z0-9-]+)_[0-9]+$ ]]; then
     rest="${BASH_REMATCH[1]}"            # is_camera overwrites BASH_REMATCH
     if is_camera "$rest"; then NAME_CAM="$rest"; else NAME_LOC="$rest"; fi
-  elif [[ "$base" =~ ${d}-([a-z0-9-]+)-[0-9]+$ ]]; then
-    rest="${BASH_REMATCH[1]}"; tail="$rest"
-    while :; do                        # longest known camera at the end wins
-      if is_camera "$tail"; then
-        NAME_CAM="$tail"
-        [[ "$tail" != "$rest" ]] && NAME_LOC="${rest%-"$tail"}"
-        return
-      fi
-      [[ "$tail" == *-* ]] || break
-      tail="${tail#*-}"
-    done
-    # No camera recognised: if the photo doesn't name one either, keep the
-    # whole middle part as the location rather than lose it.
-    [[ -z "$exif_cam" ]] && NAME_LOC="$rest"
+    return
+  elif [[ "$base" =~ ^-([a-z0-9-]+)-[0-9]{2,}$ ]]; then
+    rest="${BASH_REMATCH[1]}"            # old style with a number: -01, -123
+  elif [[ "$base" =~ ^-([a-z0-9-]+)$ ]]; then
+    rest="${BASH_REMATCH[1]}"            # old style without a number
+  else
+    return
   fi
+  tail="$rest"
+  while :; do                            # longest known camera at the end wins
+    if is_camera "$tail"; then
+      NAME_CAM="$tail"
+      [[ "$tail" != "$rest" ]] && NAME_LOC="${rest%-"$tail"}"
+      return
+    fi
+    [[ "$tail" == *-* ]] || break
+    tail="${tail#*-}"
+  done
+  NAME_LOC="$rest"                       # no camera recognised: keep it all
 }
 
 # ── read metadata (one exiftool call for the whole folder) ──────────────────
@@ -184,8 +200,9 @@ while IFS="$SEP" read -r dto cdate fmod make model city loc subloc lat lon fname
   when="${dto:-${cdate:-$fmod}}"
   # A date already at the start of the name wins over EXIF when they differ
   # (EXIF may hold an export date). Such shots sort after timed ones on that
-  # date, in filename order, which keeps their old numbering.
-  if [[ "$shot" =~ ^([0-9]{4}-[0-9]{2}-[0-9]{2}) && "${when%% *}" != "${BASH_REMATCH[1]}" ]]; then
+  # date, in filename order, which keeps their old numbering. A YYYY-MM name
+  # takes EXIF's full date only if EXIF falls in that same month.
+  if [[ "$shot" =~ ^([0-9]{4}-[0-9]{2}(-[0-9]{2})?)([-_ ]|$) && "$when" != "${BASH_REMATCH[1]}"* ]]; then
     when="${BASH_REMATCH[1]} ~$shot"
   fi
   # A shot's time is its earliest file's time.
@@ -215,7 +232,7 @@ for s in "${SHOTS[@]}"; do
   [[ -n "${SHOT_CAM[$s]}" ]] && KNOWN_CAMS[${SHOT_CAM[$s]}]=1
 done
 for s in "${SHOTS[@]}"; do
-  parse_name "$s" "${SHOT_CAM[$s]}"
+  parse_name "$s"
   SHOT_NAMELOC[$s]="$NAME_LOC"; SHOT_NAMECAM[$s]="$NAME_CAM"
 done
 
@@ -258,6 +275,7 @@ declare -A SHOT_PREFIX PREFIX_TOTAL PREFIX_SEQ
 for s in "${SHOTS[@]}"; do
   date="${DATE_ARG:-${SHOT_TIME[$s]%% *}}"
   if [[ -n "$CAMERA_ARG" ]]; then cam=$(slugify "$CAMERA_ARG")
+  elif [[ -n "${SHOT_NAMECAM[$s]}" && "${SHOT_NAMECAM[$s]}" != unknown ]]; then cam="${SHOT_NAMECAM[$s]}"
   else cam="${SHOT_CAM[$s]:-${SHOT_NAMECAM[$s]}}"; fi
   prefix=""
   for part in "$date" "${SHOT_LOC[$s]}" "$cam"; do
